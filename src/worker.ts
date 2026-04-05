@@ -1,10 +1,22 @@
-import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  runWorker,
+  type PluginContext,
+  type PluginEvent,
+  type PluginHealthDiagnostics,
+  type PluginWebhookInput,
+  type ToolResult,
+  type ToolRunContext,
+} from "@paperclipai/plugin-sdk";
 import { TOOL_NAMES, WEBHOOK_KEYS, JOB_KEYS } from "./constants.js";
 import * as github from "./github.js";
 import * as sync from "./sync.js";
 
+let pluginCtx: PluginContext | null = null;
+
 const plugin = definePlugin({
   async setup(ctx) {
+    pluginCtx = ctx;
     ctx.logger.info("GitHub Issues Sync plugin starting");
 
     // ---------------------------------------------------------------
@@ -17,19 +29,32 @@ const plugin = definePlugin({
       return ctx.secrets.resolve(ref);
     }
 
-    function getDefaultRepo(): string {
-      // Will be populated after config.get() in each handler
-      return "";
-    }
-
     // ---------------------------------------------------------------
     // Agent tool: search GitHub issues
     // ---------------------------------------------------------------
-    ctx.tools.register(TOOL_NAMES.search, async (input) => {
+    ctx.tools.register(
+      TOOL_NAMES.search,
+      {
+        displayName: "Search GitHub Issues",
+        description: "Search GitHub issues in a configured repository.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search query" },
+            repo: {
+              type: "string",
+              description: "Repository in owner/repo format. Optional if defaultRepo is configured.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      const input = params as { query?: string; repo?: string };
       const token = await resolveToken();
       const config = await ctx.config.get();
       const repo =
-        (input.parameters.repo as string) ||
+        (input.repo as string) ||
         (config.defaultRepo as string) ||
         "";
       if (!repo) {
@@ -38,7 +63,7 @@ const plugin = definePlugin({
             "No repository specified. Pass repo parameter or configure a default repository.",
         };
       }
-      const query = input.parameters.query as string;
+      const query = input.query as string;
       const results = await github.searchIssues(
         ctx.http.fetch.bind(ctx.http),
         token,
@@ -46,39 +71,63 @@ const plugin = definePlugin({
         query,
       );
       return {
-        total_count: results.total_count,
-        issues: results.items.map((issue) => ({
-          number: issue.number,
-          title: issue.title,
-          state: issue.state,
-          url: issue.html_url,
-          labels: issue.labels.map((l) => l.name),
-          assignees: issue.assignees.map((a) => a.login),
-          updated_at: issue.updated_at,
-        })),
+        content: `Found ${results.total_count} GitHub issue(s) in ${repo}.`,
+        data: {
+          total_count: results.total_count,
+          issues: results.items.map((issue) => ({
+            number: issue.number,
+            title: issue.title,
+            state: issue.state,
+            url: issue.html_url,
+            labels: issue.labels.map((l) => l.name),
+            assignees: issue.assignees.map((a) => a.login),
+            updated_at: issue.updated_at,
+          })),
+        },
       };
     });
 
     // ---------------------------------------------------------------
     // Agent tool: link a GitHub issue to the current Paperclip issue
     // ---------------------------------------------------------------
-    ctx.tools.register(TOOL_NAMES.link, async (input) => {
+    ctx.tools.register(
+      TOOL_NAMES.link,
+      {
+        displayName: "Link GitHub Issue",
+        description: "Link a GitHub issue to a Paperclip issue for sync.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            ghIssueUrl: {
+              type: "string",
+              description: "GitHub issue URL or owner/repo#number",
+            },
+            issueId: {
+              type: "string",
+              description: "Paperclip issue ID to link when no issue context is available.",
+            },
+          },
+          required: ["ghIssueUrl"],
+        },
+      },
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+      const input = params as { ghIssueUrl?: string; issueId?: string };
       const token = await resolveToken();
       const config = await ctx.config.get();
       const defaultRepo = config.defaultRepo as string | undefined;
       const ref = github.parseGitHubIssueRef(
-        input.parameters.ghIssueUrl as string,
+        input.ghIssueUrl as string,
         defaultRepo,
       );
       if (!ref) {
         return { error: "Could not parse GitHub issue reference." };
       }
 
-      const issueId = input.context?.issueId;
-      const companyId = input.context?.companyId;
+      const issueId = input.issueId || "";
+      const companyId = runCtx.companyId;
       if (!issueId || !companyId) {
         return {
-          error: "This tool must be called in the context of a Paperclip issue.",
+          error: "issueId is required for linking a GitHub issue.",
         };
       }
 
@@ -114,40 +163,66 @@ const plugin = definePlugin({
       });
 
       return {
-        linked: true,
-        github_issue: {
-          number: ghIssue.number,
-          title: ghIssue.title,
-          state: ghIssue.state,
-          url: ghIssue.html_url,
+        content: `Linked ${issueId} to ${ref.owner}/${ref.repo}#${ref.number}.`,
+        data: {
+          linked: true,
+          github_issue: {
+            number: ghIssue.number,
+            title: ghIssue.title,
+            state: ghIssue.state,
+            url: ghIssue.html_url,
+          },
+          sync_direction: link.syncDirection,
         },
-        sync_direction: link.syncDirection,
       };
     });
 
     // ---------------------------------------------------------------
     // Agent tool: unlink
     // ---------------------------------------------------------------
-    ctx.tools.register(TOOL_NAMES.unlink, async (input) => {
-      const issueId = input.context?.issueId;
+    ctx.tools.register(
+      TOOL_NAMES.unlink,
+      {
+        displayName: "Unlink GitHub Issue",
+        description: "Remove the sync link between a GitHub issue and a Paperclip issue.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: {
+              type: "string",
+              description: "Paperclip issue ID whose GitHub link should be removed.",
+            },
+          },
+          required: ["issueId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      const input = params as { issueId?: string };
+      const issueId = input.issueId;
       if (!issueId) {
         return {
-          error: "This tool must be called in the context of a Paperclip issue.",
+          error: "issueId is required.",
         };
       }
 
       const removed = await sync.removeLink(ctx, issueId);
-      return { unlinked: removed };
+      return {
+        content: removed ? `Unlinked ${issueId}.` : `No link existed for ${issueId}.`,
+        data: { unlinked: removed },
+      };
     });
 
     // ---------------------------------------------------------------
     // Paperclip event: issue status changed -> sync to GitHub
     // ---------------------------------------------------------------
     ctx.events.on("issue.updated", async (event) => {
-      const issueId = event.payload?.id as string | undefined;
+      const payload = event.payload as Record<string, unknown>;
+      const issueId =
+        (typeof payload.id === "string" ? payload.id : undefined) ??
+        event.entityId;
       if (!issueId) return;
 
-      const status = event.payload?.status as string | undefined;
+      const status = typeof payload.status === "string" ? payload.status : undefined;
       if (!status) return;
 
       const link = await sync.getLink(ctx, issueId);
@@ -164,14 +239,18 @@ const plugin = definePlugin({
     // ---------------------------------------------------------------
     // Paperclip event: comment added -> bridge to GitHub
     // ---------------------------------------------------------------
-    ctx.events.on("issue.comment_added", async (event) => {
+    (ctx.events.on as unknown as (
+      eventName: string,
+      handler: (event: PluginEvent) => Promise<void>,
+    ) => void)("issue.comment_added", async (event: PluginEvent) => {
       const config = await ctx.config.get();
       if (!config.syncComments) return;
 
-      const issueId = event.payload?.issueId as string | undefined;
-      const body = event.payload?.body as string | undefined;
+      const payload = event.payload as Record<string, unknown>;
+      const issueId = typeof payload.issueId === "string" ? payload.issueId : undefined;
+      const body = typeof payload.body === "string" ? payload.body : undefined;
       const authorName =
-        (event.payload?.authorName as string) || "Paperclip user";
+        (typeof payload.authorName === "string" ? payload.authorName : undefined) || "Paperclip user";
       if (!issueId || !body) return;
 
       const link = await sync.getLink(ctx, issueId);
@@ -182,60 +261,6 @@ const plugin = definePlugin({
         await sync.bridgeCommentToGitHub(ctx, link, token, body, authorName);
       } catch (err) {
         ctx.logger.error("Failed to bridge comment to GitHub", { error: err });
-      }
-    });
-
-    // ---------------------------------------------------------------
-    // Webhook: GitHub events
-    // ---------------------------------------------------------------
-    ctx.webhooks?.register(WEBHOOK_KEYS.github, async (delivery) => {
-      const event = delivery.headers["x-github-event"] as string | undefined;
-      const payload = delivery.parsedBody as Record<string, unknown>;
-      if (!event || !payload) return;
-
-      const action = payload.action as string | undefined;
-      const issue = payload.issue as Record<string, unknown> | undefined;
-      if (!issue) return;
-
-      const number = issue.number as number;
-      const repoObj = payload.repository as Record<string, unknown>;
-      const fullName = repoObj?.full_name as string;
-      if (!fullName) return;
-
-      const [owner, repo] = fullName.split("/");
-      if (!owner || !repo) return;
-
-      const link = await sync.getLinkByGitHub(ctx, owner, repo, number);
-      if (!link) return;
-
-      // Issue state change
-      if (event === "issues" && (action === "closed" || action === "reopened")) {
-        const ghState = (action === "closed" ? "closed" : "open") as
-          | "open"
-          | "closed";
-        const ghIssue = {
-          state: ghState,
-        } as github.GitHubIssue;
-        await sync.syncFromGitHub(ctx, link, ghIssue);
-      }
-
-      // Comment created
-      if (event === "issue_comment" && action === "created") {
-        const config = await ctx.config.get();
-        if (!config.syncComments) return;
-
-        const comment = payload.comment as Record<string, unknown>;
-        const commentBody = comment?.body as string;
-        const commentUser = (comment?.user as Record<string, unknown>)
-          ?.login as string;
-
-        // Skip comments bridged from Paperclip (prevent echo loop)
-        if (commentBody?.includes("[synced from Paperclip]")) return;
-
-        const commentUrl = comment?.html_url as string;
-        await ctx.issues.addComment(link.paperclipIssueId, {
-          body: `**@${commentUser}** ([GitHub](${commentUrl})):\n\n${commentBody}`,
-        });
       }
     });
 
@@ -259,9 +284,10 @@ const plugin = definePlugin({
     // ---------------------------------------------------------------
     // UI data: provide link info for the issue detail tab
     // ---------------------------------------------------------------
-    ctx.data.register("issue-link", async ({ issueId }) => {
+    ctx.data.register("issue-link", async (params: Record<string, unknown>) => {
+      const issueId = typeof params.issueId === "string" ? params.issueId : "";
       if (!issueId) return { linked: false };
-      const link = await sync.getLink(ctx, String(issueId));
+      const link = await sync.getLink(ctx, issueId);
       if (!link) return { linked: false };
 
       try {
@@ -305,8 +331,59 @@ const plugin = definePlugin({
     ctx.logger.info("GitHub Issues Sync plugin ready");
   },
 
-  async onHealth() {
+  async onHealth(): Promise<PluginHealthDiagnostics> {
     return { status: "ok", message: "GitHub Issues Sync operational" };
+  },
+
+  async onWebhook(input: PluginWebhookInput): Promise<void> {
+    if (input.endpointKey !== WEBHOOK_KEYS.github) return;
+    if (!pluginCtx) return;
+
+    const ctx = pluginCtx;
+    const payload = input.parsedBody as Record<string, unknown> | undefined;
+    if (!payload) return;
+
+    const event = input.headers["x-github-event"];
+    const eventName = Array.isArray(event) ? event[0] : event;
+    if (!eventName) return;
+
+    const action = payload.action as string | undefined;
+    const issue = payload.issue as Record<string, unknown> | undefined;
+    if (!issue) return;
+
+    const number = issue.number as number;
+    const repoObj = payload.repository as Record<string, unknown> | undefined;
+    const fullName = repoObj?.full_name as string | undefined;
+    if (!fullName) return;
+
+    const [owner, repo] = fullName.split("/");
+    if (!owner || !repo) return;
+
+    const link = await sync.getLinkByGitHub(ctx, owner, repo, number);
+    if (!link) return;
+
+    if (eventName === "issues" && (action === "closed" || action === "reopened")) {
+      const ghState = (action === "closed" ? "closed" : "open") as "open" | "closed";
+      await sync.syncFromGitHub(ctx, link, { state: ghState } as github.GitHubIssue);
+      return;
+    }
+
+    if (eventName === "issue_comment" && action === "created") {
+      const config = await ctx.config.get();
+      if (!config.syncComments) return;
+
+      const comment = payload.comment as Record<string, unknown> | undefined;
+      const commentBody = comment?.body as string | undefined;
+      if (!commentBody || commentBody.includes("[synced from Paperclip]")) return;
+
+      const commentUser = (comment?.user as Record<string, unknown> | undefined)?.login as string | undefined;
+      const commentUrl = comment?.html_url as string | undefined;
+      await ctx.issues.createComment(
+        link.paperclipIssueId,
+        `**@${commentUser || "github-user"}** ([GitHub](${commentUrl || link.ghHtmlUrl})):\n\n${commentBody}`,
+        link.paperclipCompanyId,
+      );
+    }
   },
 
   async onValidateConfig(config) {

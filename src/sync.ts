@@ -5,6 +5,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { Issue } from "@paperclipai/shared";
 import { STATE_KEYS } from "./constants.js";
 import * as github from "./github.js";
 
@@ -88,15 +89,13 @@ export async function createLink(
     scopeKind: "instance",
     scopeId: "default",
     stateKey: linkStateKey(params.paperclipIssueId),
-    value: JSON.stringify(link),
-  });
+  }, JSON.stringify(link));
 
   await ctx.state.set({
     scopeKind: "instance",
     scopeId: "default",
     stateKey: ghStateKey(params.ghOwner, params.ghRepo, params.ghNumber),
-    value: params.paperclipIssueId,
-  });
+  }, params.paperclipIssueId);
 
   return link;
 }
@@ -132,14 +131,13 @@ async function updateLink(
     scopeKind: "instance",
     scopeId: "default",
     stateKey: linkStateKey(link.paperclipIssueId),
-    value: JSON.stringify(link),
-  });
+  }, JSON.stringify(link));
 }
 
 /**
  * Map GitHub issue state to Paperclip issue status.
  */
-function ghStateToPaperclipStatus(ghState: "open" | "closed"): string {
+function ghStateToPaperclipStatus(ghState: "open" | "closed"): Issue["status"] {
   return ghState === "closed" ? "done" : "in_progress";
 }
 
@@ -166,7 +164,7 @@ export async function syncFromGitHub(
   }
 
   const newStatus = ghStateToPaperclipStatus(ghIssue.state);
-  await ctx.issues.update(link.paperclipIssueId, { status: newStatus });
+  await ctx.issues.update(link.paperclipIssueId, { status: newStatus }, link.paperclipCompanyId);
 
   link.lastGhState = ghIssue.state;
   await updateLink(ctx, link);
@@ -230,9 +228,11 @@ export async function syncCommentsFromGitHub(
     // Skip comments from the sync bot itself (contain the bridge marker)
     if (comment.body.includes("[synced from Paperclip]")) continue;
 
-    await ctx.issues.addComment(link.paperclipIssueId, {
-      body: `**@${comment.user.login}** ([GitHub](${comment.html_url})):\n\n${comment.body}`,
-    });
+    await ctx.issues.createComment(
+      link.paperclipIssueId,
+      `**@${comment.user.login}** ([GitHub](${comment.html_url})):\n\n${comment.body}`,
+      link.paperclipCompanyId,
+    );
     bridged++;
   }
 

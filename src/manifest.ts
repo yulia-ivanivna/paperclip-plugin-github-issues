@@ -31,6 +31,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "secrets.read-ref",
     "webhooks.receive",
     "agent.tools.register",
+    "jobs.schedule",
     "instance.settings.register",
     "ui.detailTab.register",
   ],
